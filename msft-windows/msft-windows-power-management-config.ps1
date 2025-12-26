@@ -4,11 +4,11 @@
 # This script configures Windows power management settings:
 # 1. Disables hybrid sleep across all plans
 # 2. Disables fast startup globally
-# 3. Disables hibernation completely  
+# 3. Disables hibernation on desktops only (keeps hibernation enabled on laptops)
 # 4. Stops hard disks from turning off on all plans
 # 5. Disables sleeping completely across all plans
 # 6. Allows sleeping only when the lid is shut for laptops across all plans
-# 7. Sets critical battery action to shutdown across all plans
+# 7. Sets critical battery action to hibernate (laptops) or shutdown (desktops)
 # 8. Disables USB selective suspend across all plans
 # 9. Disables PCIE Link State Power Management across all plans
 # 10. Enables all wake timers across all plans
@@ -74,6 +74,21 @@ try {
     Write-Host "✓ Running with Administrator privileges" -ForegroundColor Green
     Write-Host ""
 
+    # Detect if this is a laptop or desktop
+    Write-Host "Detecting device type..." -ForegroundColor Yellow
+    $chassisTypes = (Get-CimInstance -ClassName Win32_SystemEnclosure).ChassisTypes
+    # Laptop chassis types: 8=Portable, 9=Laptop, 10=Notebook, 14=Sub Notebook, 31=Convertible, 32=Detachable
+    $laptopChassisTypes = @(8, 9, 10, 14, 31, 32)
+    $IsLaptop = $false
+    foreach ($type in $chassisTypes) {
+        if ($laptopChassisTypes -contains $type) {
+            $IsLaptop = $true
+            break
+        }
+    }
+    Write-Host "Device Type: $(if ($IsLaptop) { 'Laptop' } else { 'Desktop' })" -ForegroundColor Cyan
+    Write-Host ""
+
     # Get all power schemes
     Write-Host "Step 1: Getting all power schemes..." -ForegroundColor Yellow
     $powerSchemes = powercfg /list | Where-Object { $_ -match "GUID: ([a-f0-9\-]+)" } | ForEach-Object {
@@ -111,17 +126,23 @@ try {
     }
     Write-Host ""
 
-    # Step 3: Disable hibernation completely
-    Write-Host "Step 3: Disabling hibernation completely..." -ForegroundColor Yellow
+    # Step 3: Configure hibernation based on device type
+    Write-Host "Step 3: Configuring hibernation..." -ForegroundColor Yellow
     try {
-        $hibernationResult = powercfg /hibernate off 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "✓ Hibernation disabled completely" -ForegroundColor Green
+        if ($IsLaptop) {
+            # Keep hibernation enabled on laptops - needed for critical battery action
+            Write-Host "✓ Hibernation kept enabled (laptop detected - needed for critical battery)" -ForegroundColor Green
         } else {
-            Write-Host "⚠ Hibernation disable command completed with warnings: $hibernationResult" -ForegroundColor Yellow
+            # Disable hibernation on desktops
+            $hibernationResult = powercfg /hibernate off 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "✓ Hibernation disabled (desktop detected)" -ForegroundColor Green
+            } else {
+                Write-Host "⚠ Hibernation disable command completed with warnings: $hibernationResult" -ForegroundColor Yellow
+            }
         }
     } catch {
-        Write-Host "❌ Failed to disable hibernation: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "❌ Failed to configure hibernation: $($_.Exception.Message)" -ForegroundColor Red
     }
     Write-Host ""
 
@@ -179,11 +200,17 @@ try {
              powercfg /setacvalueindex $($scheme.GUID) 4F971E89-EEBD-4455-A8DE-9E59040E7347 5CA83367-6E45-459F-A27B-476B1D01C936 1 | Out-Null
              powercfg /setdcvalueindex $($scheme.GUID) 4F971E89-EEBD-4455-A8DE-9E59040E7347 5CA83367-6E45-459F-A27B-476B1D01C936 1 | Out-Null
             
-                         # 4e. Set critical battery action to shutdown
-             Write-Host "  - Setting critical battery action to shutdown..." -ForegroundColor White
+                         # 4e. Set critical battery action based on device type
              # Critical battery actions: 0=Do nothing, 1=Sleep, 2=Hibernate, 3=Shut down
+             # Laptops: Hibernate (preserves state), Desktops: Shutdown
              # Using actual GUIDs: SUB_BATTERY = E73A048D-BF27-4F12-9731-8B2076E8891F, CRITBATTERYACTION = 637EA02F-BBCB-4015-8E2C-A1C7B9C0B546
-             powercfg /setdcvalueindex $($scheme.GUID) E73A048D-BF27-4F12-9731-8B2076E8891F 637EA02F-BBCB-4015-8E2C-A1C7B9C0B546 3 | Out-Null
+             if ($IsLaptop) {
+                 Write-Host "  - Setting critical battery action to hibernate (laptop)..." -ForegroundColor White
+                 powercfg /setdcvalueindex $($scheme.GUID) E73A048D-BF27-4F12-9731-8B2076E8891F 637EA02F-BBCB-4015-8E2C-A1C7B9C0B546 2 | Out-Null
+             } else {
+                 Write-Host "  - Setting critical battery action to shutdown (desktop)..." -ForegroundColor White
+                 powercfg /setdcvalueindex $($scheme.GUID) E73A048D-BF27-4F12-9731-8B2076E8891F 637EA02F-BBCB-4015-8E2C-A1C7B9C0B546 3 | Out-Null
+             }
             
             # Apply the settings to the scheme
             powercfg /setactive $($scheme.GUID) | Out-Null
@@ -296,15 +323,25 @@ try {
     }
     Write-Host ""
 
-    # Step 6: Verify hibernation is truly disabled
+    # Step 6: Verify hibernation status
     Write-Host "Step 6: Verifying hibernation status..." -ForegroundColor Yellow
     try {
         $hibernationStatus = powercfg /availablesleepstates 2>&1
-        if ($hibernationStatus -like "*Hibernate*") {
-            Write-Host "⚠ Hibernation may still be available" -ForegroundColor Yellow
-            Write-Host "Hibernation status: $hibernationStatus" -ForegroundColor Gray
+        if ($IsLaptop) {
+            # Laptops should have hibernation available
+            if ($hibernationStatus -like "*Hibernate*") {
+                Write-Host "✓ Hibernation is available (required for laptop critical battery action)" -ForegroundColor Green
+            } else {
+                Write-Host "⚠ Hibernation not available - critical battery will fall back to shutdown" -ForegroundColor Yellow
+            }
         } else {
-            Write-Host "✓ Hibernation is properly disabled" -ForegroundColor Green
+            # Desktops should have hibernation disabled
+            if ($hibernationStatus -like "*Hibernate*") {
+                Write-Host "⚠ Hibernation may still be available" -ForegroundColor Yellow
+                Write-Host "Hibernation status: $hibernationStatus" -ForegroundColor Gray
+            } else {
+                Write-Host "✓ Hibernation is properly disabled" -ForegroundColor Green
+            }
         }
     } catch {
         Write-Host "Could not verify hibernation status" -ForegroundColor Yellow
@@ -349,13 +386,22 @@ try {
 
     # Final summary
     Write-Host "=== Configuration Summary ===" -ForegroundColor Cyan
+    Write-Host "Device Type: $(if ($IsLaptop) { 'Laptop' } else { 'Desktop' })" -ForegroundColor White
     Write-Host "✓ Hybrid sleep disabled across all power plans" -ForegroundColor Green
     Write-Host "✓ Fast startup disabled globally" -ForegroundColor Green
-    Write-Host "✓ Hibernation disabled completely" -ForegroundColor Green
+    if ($IsLaptop) {
+        Write-Host "✓ Hibernation kept enabled (laptop - needed for critical battery)" -ForegroundColor Green
+    } else {
+        Write-Host "✓ Hibernation disabled (desktop)" -ForegroundColor Green
+    }
     Write-Host "✓ Hard disk turn off disabled on all plans" -ForegroundColor Green
     Write-Host "✓ Automatic sleep disabled across all plans" -ForegroundColor Green
     Write-Host "✓ Lid close action set to sleep (laptops only)" -ForegroundColor Green
-    Write-Host "✓ Critical battery action set to shutdown" -ForegroundColor Green
+    if ($IsLaptop) {
+        Write-Host "✓ Critical battery action set to hibernate (laptop)" -ForegroundColor Green
+    } else {
+        Write-Host "✓ Critical battery action set to shutdown (desktop)" -ForegroundColor Green
+    }
     Write-Host "✓ USB selective suspend disabled for stability" -ForegroundColor Green
     Write-Host "✓ PCIE Link State Power Management disabled for stability" -ForegroundColor Green
     Write-Host "✓ Wake timers enabled to allow scheduled tasks" -ForegroundColor Green
